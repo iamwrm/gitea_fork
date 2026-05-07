@@ -1,0 +1,975 @@
+diff --git a/options/locale/locale_en-US.ini b/options/locale/locale_en-US.ini
+index a74cf843e9..99c3757f54 100644
+--- a/options/locale/locale_en-US.ini
++++ b/options/locale/locale_en-US.ini
+@@ -1268,6 +1268,11 @@ file_view_rendered = View rendered
+ file_view_raw = View raw
+ file_permalink = Permalink
+ file_too_large = The file is too large to be shown.
++archive_content.name = Name
++archive_content.root = Archive
++archive_content.size = Size
++archive_content.truncated = This archive has more entries that are not shown.
++archive_content.view_unsupported = This archive entry cannot be previewed.
+ invisible_runes_header = `This file contains invisible Unicode characters`
+ invisible_runes_description = `This file contains invisible Unicode characters that are indistinguishable to humans but may be processed differently by a computer. If you think that this is intentional, you can safely ignore this warning. Use the Escape button to reveal them.`
+ ambiguous_runes_header = `This file contains ambiguous Unicode characters`
+diff --git a/routers/web/repo/render.go b/routers/web/repo/render.go
+index 05eeadc519..de832f202f 100644
+--- a/routers/web/repo/render.go
++++ b/routers/web/repo/render.go
+@@ -6,6 +6,7 @@ package repo
+ import (
+ 	"bytes"
+ 	"io"
++	"mime"
+ 	"net/http"
+ 	"path"
+ 
+@@ -47,8 +48,15 @@ func RenderFile(ctx *context.Context) {
+ 	rd := charset.ToUTF8WithFallbackReader(io.MultiReader(bytes.NewReader(buf), dataRc), charset.ConvertOpts{})
+ 	ctx.Resp.Header().Add("Content-Security-Policy", "frame-src 'self'; sandbox allow-scripts")
+ 
++	if isHTMLPreviewFileName(blob.Name()) {
++		setPlainRenderContentType(ctx)
++		_, _ = io.Copy(ctx.Resp, rd)
++		return
++	}
++
+ 	if markupType := markup.Type(blob.Name()); markupType == "" {
+ 		if isTextFile {
++			setPlainRenderContentType(ctx)
+ 			_, _ = io.Copy(ctx.Resp, rd)
+ 		} else {
+ 			http.Error(ctx.Resp, "Unsupported file type render", http.StatusInternalServerError)
+@@ -74,3 +82,11 @@ func RenderFile(ctx *context.Context) {
+ 		return
+ 	}
+ }
++
++func setPlainRenderContentType(ctx *context.Context) {
++	if contentType := mime.TypeByExtension(path.Ext(ctx.Repo.TreePath)); contentType != "" {
++		ctx.Resp.Header().Set("Content-Type", contentType)
++	} else {
++		ctx.Resp.Header().Set("Content-Type", "text/plain; charset=utf-8")
++	}
++}
+diff --git a/routers/web/repo/view.go b/routers/web/repo/view.go
+index df0255279a..dfdc176735 100644
+--- a/routers/web/repo/view.go
++++ b/routers/web/repo/view.go
+@@ -513,6 +513,10 @@ func renderFile(ctx *context.Context, entry *git.TreeEntry) {
+ 			ctx.Data["CanCopyContent"] = true
+ 			ctx.Data["HasSourceRenderedToggle"] = true
+ 		}
++		htmlPreview := isHTMLPreviewFileName(blob.Name())
++		if htmlPreview {
++			ctx.Data["HasSourceRenderedToggle"] = true
++		}
+ 
+ 		if fInfo.fileSize >= setting.UI.MaxDisplayFileSize {
+ 			ctx.Data["IsFileTooLarge"] = true
+@@ -537,7 +541,11 @@ func renderFile(ctx *context.Context, entry *git.TreeEntry) {
+ 			ctx.Data["HasSourceRenderedToggle"] = true
+ 		}
+ 
+-		if markupType != "" && !shouldRenderSource {
++		if htmlPreview && !shouldRenderSource {
++			ctx.Data["IsRenderedHTML"] = true
++			ctx.Data["HTMLRenderLink"] = ctx.Repo.RepoLink + "/render/" + ctx.Repo.BranchNameSubURL() + "/" + util.PathEscapeSegments(ctx.Repo.TreePath)
++			ctx.Resp.Header().Add("Content-Security-Policy", "frame-src 'self'")
++		} else if markupType != "" && !shouldRenderSource {
+ 			ctx.Data["IsMarkup"] = true
+ 			ctx.Data["MarkupType"] = markupType
+ 			if !detected {
+@@ -626,6 +634,71 @@ func renderFile(ctx *context.Context, entry *git.TreeEntry) {
+ 			}
+ 		}
+ 
++	case isSupportedArchiveFileName(blob.Name()):
++		if fInfo.fileSize >= setting.UI.MaxDisplayFileSize {
++			ctx.Data["IsFileTooLarge"] = true
++			break
++		}
++
++		ctx.Data["IsArchiveFile"] = true
++		archiveBaseLink := ctx.Repo.RepoLink + "/src/" + ctx.Repo.BranchNameSubURL() + "/" + util.PathEscapeSegments(ctx.Repo.TreePath)
++		archivePath := cleanArchiveFileName(ctx.FormString("archive_path"))
++		if archivePath != "" {
++			ctx.Data["RawFileLink"] = archiveRawLink(archiveBaseLink, archivePath)
++			if ctx.FormString("archive_raw") == "1" {
++				if err := serveArchiveRaw(ctx, blob.Name(), io.MultiReader(bytes.NewReader(buf), dataRc), archivePath); err != nil {
++					if errors.Is(err, errArchivePathNotFound) {
++						ctx.NotFound("serveArchiveRaw", err)
++					} else {
++						ctx.ServerError("serveArchiveRaw", err)
++					}
++				}
++				return
++			}
++		}
++
++		archiveView, err := readArchiveFile(blob.Name(), io.MultiReader(bytes.NewReader(buf), dataRc), archivePath, archiveBaseLink, setting.UI.MaxDisplayFileSize)
++		if err != nil {
++			ctx.Data["FileError"] = strings.TrimSpace(err.Error())
++			break
++		}
++		ctx.Data["ArchiveRootLink"] = archiveBaseLink
++
++		if archiveView.Content != nil {
++			content := archiveView.Content
++			ctx.Data["ArchivePath"] = content.Entry.Name
++			if parent := path.Dir(content.Entry.Name); parent != "." {
++				ctx.Data["ArchiveParentLink"] = archiveEntryLink(archiveBaseLink, parent)
++			} else {
++				ctx.Data["ArchiveParentLink"] = archiveBaseLink
++			}
++			if content.TooLarge {
++				ctx.Data["IsTextSource"] = true
++				ctx.Data["IsFileTooLarge"] = true
++				break
++			}
++			contentType := typesniffer.DetectContentType(content.Content, content.Entry.Name)
++			if contentType.IsImage() && (setting.UI.SVG.Enabled || !contentType.IsSvgImage()) {
++				ctx.Data["ArchiveEntryDataURI"] = template.URL("data:" + contentType.GetMimeType() + ";base64," + base64.StdEncoding.EncodeToString(content.Content))
++				break
++			}
++			if !contentType.IsText() {
++				ctx.Data["FileError"] = ctx.Tr("repo.archive_content.view_unsupported")
++				break
++			}
++			ctx.Data["IsTextSource"] = true
++			ctx.Data["CanCopyContent"] = true
++			if err := renderCodeContent(ctx, content.Entry.Name, "", content.Content); err != nil {
++				ctx.ServerError("renderCodeContent", err)
++				return
++			}
++		} else if archiveView.Listing != nil {
++			ctx.Data["ArchivePath"] = archiveView.Listing.Path
++			ctx.Data["ArchiveParentLink"] = archiveView.Listing.ParentLink
++			ctx.Data["ArchiveEntries"] = archiveView.Listing.Entries
++			ctx.Data["ArchiveEntriesTruncated"] = archiveView.Listing.Truncated
++		}
++
+ 	case fInfo.st.IsPDF():
+ 		ctx.Data["IsPDFFile"] = true
+ 	case fInfo.st.IsVideo():
+@@ -728,6 +801,54 @@ func markupRender(ctx *context.Context, renderCtx *markup.RenderContext, input i
+ 	return escaped, output, err
+ }
+ 
++func renderCodeContent(ctx *context.Context, filename, language string, content []byte) error {
++	rd := charset.ToUTF8WithFallbackReader(bytes.NewReader(content), charset.ConvertOpts{})
++	buf, err := io.ReadAll(rd)
++	if err != nil {
++		return err
++	}
++
++	if len(buf) == 0 {
++		ctx.Data["NumLines"] = 0
++	} else {
++		hasNoTrailingEOL := !bytes.HasSuffix(buf, []byte{'\n'})
++		ctx.Data["HasNoTrailingEOL"] = hasNoTrailingEOL
++
++		numLines := bytes.Count(buf, []byte{'\n'})
++		if hasNoTrailingEOL {
++			numLines++
++		}
++		ctx.Data["NumLines"] = numLines
++	}
++	ctx.Data["NumLinesSet"] = true
++
++	fileContent, lexerName, err := highlight.File(filename, language, buf)
++	ctx.Data["LexerName"] = lexerName
++	if err != nil {
++		log.Error("highlight.File failed, fallback to plain text: %v", err)
++		fileContent = highlight.PlainText(buf)
++	}
++	status := &charset.EscapeStatus{}
++	statuses := make([]*charset.EscapeStatus, len(fileContent))
++	for i, line := range fileContent {
++		statuses[i], fileContent[i] = charset.EscapeControlHTML(line, ctx.Locale, charset.FileviewContext)
++		status = status.Or(statuses[i])
++	}
++	ctx.Data["EscapeStatus"] = status
++	ctx.Data["FileContent"] = fileContent
++	ctx.Data["LineEscapeStatus"] = statuses
++	return nil
++}
++
++func isHTMLPreviewFileName(name string) bool {
++	switch strings.ToLower(path.Ext(name)) {
++	case ".html", ".htm":
++		return true
++	default:
++		return false
++	}
++}
++
+ func checkHomeCodeViewable(ctx *context.Context) {
+ 	if len(ctx.Repo.Units) > 0 {
+ 		if ctx.Repo.Repository.IsBeingCreated() {
+diff --git a/templates/repo/view_file.tmpl b/templates/repo/view_file.tmpl
+index 411abfa7b4..50bd4faebe 100644
+--- a/templates/repo/view_file.tmpl
++++ b/templates/repo/view_file.tmpl
+@@ -109,14 +109,64 @@
+ 		{{if not (or .IsMarkup .IsRenderedHTML)}}
+ 			{{template "repo/unicode_escape_prompt" dict "EscapeStatus" .EscapeStatus "root" $}}
+ 		{{end}}
+-		<div class="file-view{{if .IsMarkup}} markup {{.MarkupType}}{{else if .IsPlainText}} plain-text{{else if .IsTextSource}} code-view{{end}}">
+-			{{if .IsMarkup}}
++		<div class="file-view{{if .IsMarkup}} markup {{.MarkupType}}{{else if .IsRenderedHTML}} html-preview{{else if .IsPlainText}} plain-text{{else if .IsTextSource}} code-view{{end}}">
++			{{if .IsArchiveFile}}
++				<div class="tw-flex tw-items-center tw-gap-2 tw-p-2 tw-border-b tw-border-secondary">
++					{{svg "octicon-file-zip" 16}}
++					<a href="{{.ArchiveRootLink}}">{{ctx.Locale.Tr "repo.archive_content.root"}}</a>
++					{{if .ArchivePath}}
++						<span>/</span>
++						<span class="text light-2">{{.ArchivePath}}</span>
++					{{end}}
++				</div>
++			{{end}}
++			{{if .IsRenderedHTML}}
++				<iframe src="{{.HTMLRenderLink}}" class="tw-block tw-w-full tw-border-0" width="100%" height="720" sandbox="allow-scripts"></iframe>
++			{{else if .IsMarkup}}
+ 				{{if .FileContent}}{{.FileContent}}{{end}}
+ 			{{else if .IsPlainText}}
+ 				<pre>{{if .FileContent}}{{.FileContent}}{{end}}</pre>
+ 			{{else if not .IsTextSource}}
+ 				<div class="view-raw">
+-					{{if .IsImageFile}}
++					{{if .ArchiveEntryDataURI}}
++						{{if .ArchiveParentLink}}
++							<div class="tw-p-2 tw-border-b tw-border-secondary">
++								<a class="muted" href="{{.ArchiveParentLink}}">{{svg "octicon-reply" 16 "tw-mr-2"}}..</a>
++							</div>
++						{{end}}
++						<img src="{{.ArchiveEntryDataURI}}">
++					{{else if .IsArchiveFile}}
++						<table class="ui single line table">
++							<thead>
++								<tr>
++									<th>{{ctx.Locale.Tr "repo.archive_content.name"}}</th>
++									<th class="right aligned">{{ctx.Locale.Tr "repo.archive_content.size"}}</th>
++								</tr>
++							</thead>
++							<tbody>
++								{{if .ArchiveParentLink}}
++									<tr>
++										<td colspan="2">
++											<a class="muted" href="{{.ArchiveParentLink}}">{{svg "octicon-reply" 16 "tw-mr-2"}}..</a>
++										</td>
++									</tr>
++								{{end}}
++								{{range .ArchiveEntries}}
++									<tr>
++										<td>
++											<a class="muted" href="{{.Link}}" title="{{.Name}}">
++												{{if .IsDir}}{{svg "octicon-file-directory-fill" 16 "tw-mr-2"}}{{else}}{{svg "octicon-file" 16 "tw-mr-2"}}{{end}}{{.DisplayName}}
++											</a>
++										</td>
++										<td class="right aligned">{{if not .IsDir}}{{ctx.Locale.TrSize .Size}}{{end}}</td>
++									</tr>
++								{{end}}
++							</tbody>
++						</table>
++						{{if .ArchiveEntriesTruncated}}
++							<div class="ui warning message">{{ctx.Locale.Tr "repo.archive_content.truncated"}}</div>
++						{{end}}
++					{{else if .IsImageFile}}
+ 						<img src="{{$.RawFileLink}}">
+ 					{{else if .IsVideoFile}}
+ 						<video controls src="{{$.RawFileLink}}">
+diff --git a/tests/integration/repo_view_test.go b/tests/integration/repo_view_test.go
+index 74864765ea..dbf0ac13f2 100644
+--- a/tests/integration/repo_view_test.go
++++ b/tests/integration/repo_view_test.go
+@@ -4,6 +4,10 @@
+ package integration
+ 
+ import (
++	"archive/tar"
++	"archive/zip"
++	"bytes"
++	"compress/gzip"
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
+@@ -20,6 +24,7 @@ import (
+ 	"forgejo.org/tests"
+ 
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ )
+ 
+ func createRepoAndGetContext(t *testing.T, files []string, deleteMdReadme bool) (*context.Context, func()) {
+@@ -240,3 +245,200 @@ func TestRepoViewFileLines(t *testing.T) {
+ 		})
+ 	})
+ }
++
++func TestRepoViewArchiveFiles(t *testing.T) {
++	onApplicationRun(t, func(t *testing.T, _ *url.URL) {
++		user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
++		zipContent := makeTestZipArchive(t)
++		tarGzContent := makeTestTarGzArchive(t)
++		repo, _, f := tests.CreateDeclarativeRepo(t, user, "archive-files", []unit_model.Type{unit_model.TypeCode}, nil, []*files_service.ChangeRepoFile{
++			{
++				Operation:     "create",
++				TreePath:      "example.zip",
++				ContentReader: bytes.NewReader(zipContent),
++			},
++			{
++				Operation:     "create",
++				TreePath:      "example.tar.gz",
++				ContentReader: bytes.NewReader(tarGzContent),
++			},
++		})
++		defer f()
++
++		testArchive := func(t *testing.T, filename, expectedText string) {
++			t.Helper()
++			req := NewRequestf(t, "GET", "%s/src/branch/main/%s", repo.Link(), filename)
++			resp := MakeRequest(t, req, http.StatusOK)
++			htmlDoc := NewHTMLParser(t, resp.Body)
++
++			archiveTable := htmlDoc.Find(".view-raw table")
++			require.Equal(t, 1, archiveTable.Length())
++			assert.Contains(t, archiveTable.Text(), "docs")
++			assert.Contains(t, archiveTable.Text(), "hello.txt")
++			assert.NotContains(t, archiveTable.Text(), "docs/readme.txt")
++			assert.NotContains(t, htmlDoc.Find(".view-raw").Text(), "View raw")
++
++			req = NewRequestf(t, "GET", "%s/src/branch/main/%s?archive_path=docs", repo.Link(), filename)
++			resp = MakeRequest(t, req, http.StatusOK)
++			htmlDoc = NewHTMLParser(t, resp.Body)
++			archiveTable = htmlDoc.Find(".view-raw table")
++			require.Equal(t, 1, archiveTable.Length())
++			assert.Contains(t, archiveTable.Text(), "..")
++			assert.Contains(t, archiveTable.Text(), "readme.txt")
++			assert.NotContains(t, archiveTable.Text(), "hello.txt")
++			assert.Greater(t, htmlDoc.Find(`.file-actions a[href*="archive_raw=1"]`).Length(), 0)
++
++			req = NewRequestf(t, "GET", "%s/src/branch/main/%s?archive_path=docs/readme.txt", repo.Link(), filename)
++			resp = MakeRequest(t, req, http.StatusOK)
++			htmlDoc = NewHTMLParser(t, resp.Body)
++			assert.Equal(t, 0, htmlDoc.Find(".view-raw table").Length())
++			assert.Contains(t, htmlDoc.Find(".code-view").Text(), expectedText)
++			assert.Greater(t, htmlDoc.Find(`.file-actions a[href*="archive_raw=1"]`).Length(), 0)
++
++			req = NewRequestf(t, "GET", "%s/src/branch/main/%s?archive_path=docs/logo.png", repo.Link(), filename)
++			resp = MakeRequest(t, req, http.StatusOK)
++			htmlDoc = NewHTMLParser(t, resp.Body)
++			src, ok := htmlDoc.Find(".view-raw img").Attr("src")
++			require.True(t, ok)
++			assert.Contains(t, src, "data:image/png;base64,")
++			assert.NotContains(t, htmlDoc.Find(".view-raw").Text(), "cannot be previewed")
++
++			req = NewRequestf(t, "GET", "%s/src/branch/main/%s?archive_path=docs/readme.txt&archive_raw=1", repo.Link(), filename)
++			resp = MakeRequest(t, req, http.StatusOK)
++			assert.Contains(t, resp.Header().Get("Content-Disposition"), `filename="readme.txt"`)
++			assert.Equal(t, expectedText, resp.Body.String())
++
++			req = NewRequestf(t, "GET", "%s/src/branch/main/%s?archive_path=docs&archive_raw=1", repo.Link(), filename)
++			resp = MakeRequest(t, req, http.StatusOK)
++			assert.Contains(t, resp.Header().Get("Content-Disposition"), `filename="docs.zip"`)
++			zr, err := zip.NewReader(bytes.NewReader(resp.Body.Bytes()), int64(resp.Body.Len()))
++			require.NoError(t, err)
++			names := map[string]bool{}
++			for _, file := range zr.File {
++				names[file.Name] = true
++			}
++			assert.Contains(t, names, "docs/readme.txt")
++			assert.Contains(t, names, "docs/logo.png")
++		}
++
++		t.Run("zip", func(t *testing.T) {
++			defer tests.PrintCurrentTest(t)()
++			testArchive(t, "example.zip", "zip readme")
++		})
++		t.Run("tar.gz", func(t *testing.T) {
++			defer tests.PrintCurrentTest(t)()
++			testArchive(t, "example.tar.gz", "tar readme")
++		})
++	})
++}
++
++func TestRepoViewHTMLPreview(t *testing.T) {
++	onApplicationRun(t, func(t *testing.T, _ *url.URL) {
++		user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 2})
++		repo, _, f := tests.CreateDeclarativeRepo(t, user, "html-preview", []unit_model.Type{unit_model.TypeCode}, nil, []*files_service.ChangeRepoFile{
++			{
++				Operation: "create",
++				TreePath:  "tool.html",
++				ContentReader: strings.NewReader(`<!doctype html>
++<html>
++<head><script src="tool.js"></script></head>
++<body><button id="run">Hash</button></body>
++</html>`),
++			},
++			{
++				Operation:     "create",
++				TreePath:      "tool.js",
++				ContentReader: strings.NewReader(`document.body.dataset.loaded = "yes";`),
++			},
++		})
++		defer f()
++
++		req := NewRequestf(t, "GET", "%s/src/branch/main/tool.html", repo.Link())
++		resp := MakeRequest(t, req, http.StatusOK)
++		htmlDoc := NewHTMLParser(t, resp.Body)
++		iframe := htmlDoc.Find(`.file-view.html-preview iframe[sandbox="allow-scripts"]`)
++		require.Equal(t, 1, iframe.Length())
++		src, ok := iframe.Attr("src")
++		require.True(t, ok)
++		assert.Equal(t, repo.Link()+"/render/branch/main/tool.html", src)
++		assert.Greater(t, htmlDoc.Find(".file-actions a.active").Length(), 0)
++		assert.Contains(t, resp.Header().Get("Content-Security-Policy"), "frame-src 'self'")
++
++		req = NewRequestf(t, "GET", "%s/src/branch/main/tool.html?display=source", repo.Link())
++		resp = MakeRequest(t, req, http.StatusOK)
++		htmlDoc = NewHTMLParser(t, resp.Body)
++		assert.Equal(t, 0, htmlDoc.Find(`.file-view.html-preview iframe`).Length())
++		assert.Contains(t, htmlDoc.Find(".code-view").Text(), "Hash")
++
++		req = NewRequestf(t, "GET", "%s/render/branch/main/tool.html", repo.Link())
++		resp = MakeRequest(t, req, http.StatusOK)
++		assert.Contains(t, resp.Header().Get("Content-Type"), "text/html")
++		assert.Contains(t, resp.Header().Get("Content-Security-Policy"), "sandbox allow-scripts")
++		assert.Contains(t, resp.Body.String(), `<button id="run">Hash</button>`)
++
++		req = NewRequestf(t, "GET", "%s/render/branch/main/tool.js", repo.Link())
++		resp = MakeRequest(t, req, http.StatusOK)
++		assert.Contains(t, resp.Header().Get("Content-Type"), "javascript")
++		assert.Contains(t, resp.Body.String(), `document.body.dataset.loaded`)
++	})
++}
++
++func makeTestZipArchive(t *testing.T) []byte {
++	t.Helper()
++	var buf bytes.Buffer
++	zw := zip.NewWriter(&buf)
++	_, err := zw.Create("docs/")
++	require.NoError(t, err)
++	w, err := zw.Create("docs/readme.txt")
++	require.NoError(t, err)
++	_, err = w.Write([]byte("zip readme"))
++	require.NoError(t, err)
++	w, err = zw.Create("docs/logo.png")
++	require.NoError(t, err)
++	_, err = w.Write(testPNGContent)
++	require.NoError(t, err)
++	w, err = zw.Create("hello.txt")
++	require.NoError(t, err)
++	_, err = w.Write([]byte("hello zip"))
++	require.NoError(t, err)
++	require.NoError(t, zw.Close())
++	return buf.Bytes()
++}
++
++func makeTestTarGzArchive(t *testing.T) []byte {
++	t.Helper()
++	var buf bytes.Buffer
++	gzw := gzip.NewWriter(&buf)
++	tw := tar.NewWriter(gzw)
++	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "docs", Typeflag: tar.TypeDir, Mode: 0o755}))
++	writeTarFile(t, tw, "docs/readme.txt", "tar readme")
++	writeTarFileBytes(t, tw, "docs/logo.png", testPNGContent)
++	writeTarFile(t, tw, "hello.txt", "hello tar")
++	require.NoError(t, tw.Close())
++	require.NoError(t, gzw.Close())
++	return buf.Bytes()
++}
++
++func writeTarFile(t *testing.T, tw *tar.Writer, name, content string) {
++	t.Helper()
++	writeTarFileBytes(t, tw, name, []byte(content))
++}
++
++func writeTarFileBytes(t *testing.T, tw *tar.Writer, name string, content []byte) {
++	t.Helper()
++	require.NoError(t, tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(content))}))
++	_, err := tw.Write(content)
++	require.NoError(t, err)
++}
++
++var testPNGContent = []byte{
++	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
++	0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
++	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
++	0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
++	0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41,
++	0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
++	0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
++	0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
++	0x42, 0x60, 0x82,
++}
+diff --git a/routers/web/repo/archive_file.go b/routers/web/repo/archive_file.go
+new file mode 100644
+index 0000000000..383fbf1778
+--- /dev/null
++++ b/routers/web/repo/archive_file.go
+@@ -0,0 +1,462 @@
++// Copyright 2026 The Forgejo Authors. All rights reserved.
++// SPDX-License-Identifier: MIT
++
++package repo
++
++import (
++	"archive/tar"
++	"archive/zip"
++	"bytes"
++	"compress/gzip"
++	"errors"
++	"io"
++	"net/url"
++	"path"
++	"sort"
++	"strings"
++
++	"forgejo.org/modules/httplib"
++	"forgejo.org/modules/typesniffer"
++	"forgejo.org/modules/util"
++	"forgejo.org/services/context"
++)
++
++const maxArchiveFileEntries = 1000
++
++var errArchivePathNotFound = errors.New("archive path not found")
++
++type archiveFileEntry struct {
++	Name        string
++	DisplayName string
++	Link        string
++	IsDir       bool
++	Size        int64
++}
++
++type archiveFileListing struct {
++	Path       string
++	ParentLink string
++	Entries    []archiveFileEntry
++	Truncated  bool
++}
++
++type archiveFileContent struct {
++	Entry    archiveFileEntry
++	Content  []byte
++	TooLarge bool
++}
++
++type archiveFileView struct {
++	Listing *archiveFileListing
++	Content *archiveFileContent
++}
++
++func isSupportedArchiveFileName(name string) bool {
++	name = strings.ToLower(name)
++	return strings.HasSuffix(name, ".zip") || strings.HasSuffix(name, ".tar.gz")
++}
++
++func readArchiveFile(name string, r io.Reader, archivePath, baseLink string, maxContentSize int64) (*archiveFileView, error) {
++	archivePath = cleanArchiveFileName(archivePath)
++	name = strings.ToLower(name)
++	if strings.HasSuffix(name, ".zip") {
++		buf, err := io.ReadAll(r)
++		if err != nil {
++			return nil, err
++		}
++		return readZipArchive(buf, archivePath, baseLink, maxContentSize)
++	}
++	if strings.HasSuffix(name, ".tar.gz") {
++		return readTarGzArchive(r, archivePath, baseLink, maxContentSize)
++	}
++	return nil, errors.New("unsupported archive format")
++}
++
++func readZipArchive(buf []byte, archivePath, baseLink string, maxContentSize int64) (*archiveFileView, error) {
++	zr, err := zip.NewReader(bytes.NewReader(buf), int64(len(buf)))
++	if err != nil {
++		return nil, err
++	}
++
++	builder := newArchiveFileListing()
++	var selected *zip.File
++	var selectedEntry archiveFileEntry
++	for _, file := range zr.File {
++		name := cleanArchiveFileName(file.Name)
++		if name == "" {
++			continue
++		}
++		isDir := file.FileInfo().IsDir()
++		if builder.add(name, isDir, int64(file.UncompressedSize64)) {
++			break
++		}
++		if name == archivePath && !isDir {
++			selected = file
++			selectedEntry = archiveFileEntry{Name: name, DisplayName: path.Base(name), Link: archiveEntryLink(baseLink, name), Size: int64(file.UncompressedSize64)}
++		}
++	}
++
++	if selected != nil {
++		if selected.UncompressedSize64 >= uint64(maxContentSize) {
++			return &archiveFileView{Content: &archiveFileContent{Entry: selectedEntry, TooLarge: true}}, nil
++		}
++		rc, err := selected.Open()
++		if err != nil {
++			return nil, err
++		}
++		defer rc.Close()
++		content, err := io.ReadAll(rc)
++		if err != nil {
++			return nil, err
++		}
++		return &archiveFileView{Content: &archiveFileContent{Entry: selectedEntry, Content: content}}, nil
++	}
++
++	return &archiveFileView{Listing: builder.finish(archivePath, baseLink)}, nil
++}
++
++func readTarGzArchive(r io.Reader, archivePath, baseLink string, maxContentSize int64) (*archiveFileView, error) {
++	gzr, err := gzip.NewReader(r)
++	if err != nil {
++		return nil, err
++	}
++	defer gzr.Close()
++
++	builder := newArchiveFileListing()
++	tr := tar.NewReader(gzr)
++	for {
++		header, err := tr.Next()
++		if errors.Is(err, io.EOF) {
++			break
++		}
++		if err != nil {
++			return nil, err
++		}
++
++		name := cleanArchiveFileName(header.Name)
++		if name == "" {
++			continue
++		}
++		isDir := header.FileInfo().IsDir()
++		if builder.add(name, isDir, header.Size) {
++			break
++		}
++		if name == archivePath && !isDir {
++			entry := archiveFileEntry{Name: name, DisplayName: path.Base(name), Link: archiveEntryLink(baseLink, name), Size: header.Size}
++			if header.Size >= maxContentSize {
++				return &archiveFileView{Content: &archiveFileContent{Entry: entry, TooLarge: true}}, nil
++			}
++			content, err := io.ReadAll(tr)
++			if err != nil {
++				return nil, err
++			}
++			return &archiveFileView{Content: &archiveFileContent{Entry: entry, Content: content}}, nil
++		}
++	}
++	return &archiveFileView{Listing: builder.finish(archivePath, baseLink)}, nil
++}
++
++type archiveFileListingBuilder struct {
++	entries   map[string]archiveFileEntry
++	truncated bool
++}
++
++func newArchiveFileListing() *archiveFileListingBuilder {
++	return &archiveFileListingBuilder{entries: make(map[string]archiveFileEntry)}
++}
++
++func (b *archiveFileListingBuilder) add(name string, isDir bool, size int64) bool {
++	name = cleanArchiveFileName(name)
++	if name == "" {
++		return false
++	}
++
++	parts := strings.Split(name, "/")
++	for i := 1; i < len(parts); i++ {
++		if b.addEntry(strings.Join(parts[:i], "/"), true, 0) {
++			return true
++		}
++	}
++	return b.addEntry(name, isDir, size)
++}
++
++func (b *archiveFileListingBuilder) addEntry(name string, isDir bool, size int64) bool {
++	if _, ok := b.entries[name]; ok {
++		return false
++	}
++	if len(b.entries) >= maxArchiveFileEntries {
++		b.truncated = true
++		return true
++	}
++	b.entries[name] = archiveFileEntry{Name: name, IsDir: isDir, Size: size}
++	return false
++}
++
++func (b *archiveFileListingBuilder) finish(archivePath, baseLink string) *archiveFileListing {
++	entries := make([]archiveFileEntry, 0, len(b.entries))
++	for _, entry := range b.entries {
++		if entry.Name == archivePath || !isArchiveChild(entry.Name, archivePath) {
++			continue
++		}
++		entry.DisplayName = strings.TrimPrefix(entry.Name, archivePath)
++		entry.DisplayName = strings.TrimPrefix(entry.DisplayName, "/")
++		if strings.Contains(entry.DisplayName, "/") {
++			continue
++		}
++		entry.Link = archiveEntryLink(baseLink, entry.Name)
++		entries = append(entries, entry)
++	}
++	sort.Slice(entries, func(i, j int) bool {
++		if entries[i].IsDir != entries[j].IsDir {
++			return entries[i].IsDir
++		}
++		return entries[i].DisplayName < entries[j].DisplayName
++	})
++
++	listing := &archiveFileListing{Path: archivePath, Entries: entries, Truncated: b.truncated}
++	if archivePath != "" {
++		parent := path.Dir(archivePath)
++		if parent == "." {
++			listing.ParentLink = baseLink
++		} else {
++			listing.ParentLink = archiveEntryLink(baseLink, parent)
++		}
++	}
++	return listing
++}
++
++func isArchiveChild(name, archivePath string) bool {
++	if archivePath == "" {
++		return !strings.Contains(name, "/")
++	}
++	return strings.HasPrefix(name, archivePath+"/")
++}
++
++func archiveEntryLink(baseLink, name string) string {
++	return baseLink + "?archive_path=" + url.QueryEscape(name)
++}
++
++func archiveRawLink(baseLink, name string) string {
++	return archiveEntryLink(baseLink, name) + "&archive_raw=1"
++}
++
++func serveArchiveRaw(ctx *context.Context, archiveName string, r io.Reader, archivePath string) error {
++	archivePath = cleanArchiveFileName(archivePath)
++	if archivePath == "" {
++		return errArchivePathNotFound
++	}
++
++	archiveName = strings.ToLower(archiveName)
++	if strings.HasSuffix(archiveName, ".zip") {
++		buf, err := io.ReadAll(r)
++		if err != nil {
++			return err
++		}
++		return serveZipArchiveRaw(ctx, buf, archivePath)
++	}
++	if strings.HasSuffix(archiveName, ".tar.gz") {
++		return serveTarGzArchiveRaw(ctx, r, archivePath)
++	}
++	return errors.New("unsupported archive format")
++}
++
++func serveZipArchiveRaw(ctx *context.Context, buf []byte, archivePath string) error {
++	zr, err := zip.NewReader(bytes.NewReader(buf), int64(len(buf)))
++	if err != nil {
++		return err
++	}
++
++	var dirFound bool
++	dirBuf := bytes.Buffer{}
++	zw := zip.NewWriter(&dirBuf)
++	dirEntryCount := 0
++	for _, file := range zr.File {
++		name := cleanArchiveFileName(file.Name)
++		if name == "" {
++			continue
++		}
++
++		if name == archivePath {
++			if !file.FileInfo().IsDir() {
++				rc, err := file.Open()
++				if err != nil {
++					_ = zw.Close()
++					return err
++				}
++				defer rc.Close()
++				_ = zw.Close()
++				return serveArchiveEntryAttachment(ctx, name, int64(file.UncompressedSize64), rc)
++			}
++			dirFound = true
++		}
++
++		if name == archivePath || isArchiveChild(name, archivePath) {
++			if err := copyZipFileToZip(zw, file, name); err != nil {
++				_ = zw.Close()
++				return err
++			}
++			dirEntryCount++
++		}
++	}
++
++	if dirEntryCount > 0 || dirFound {
++		if err := zw.Close(); err != nil {
++			return err
++		}
++		return serveArchiveZipAttachment(ctx, archivePath, dirBuf.Bytes())
++	}
++	_ = zw.Close()
++	return errArchivePathNotFound
++}
++
++func serveTarGzArchiveRaw(ctx *context.Context, r io.Reader, archivePath string) error {
++	gzr, err := gzip.NewReader(r)
++	if err != nil {
++		return err
++	}
++	defer gzr.Close()
++
++	dirBuf := bytes.Buffer{}
++	zw := zip.NewWriter(&dirBuf)
++	dirEntryCount := 0
++	tr := tar.NewReader(gzr)
++	for {
++		header, err := tr.Next()
++		if errors.Is(err, io.EOF) {
++			break
++		}
++		if err != nil {
++			_ = zw.Close()
++			return err
++		}
++
++		name := cleanArchiveFileName(header.Name)
++		if name == "" {
++			continue
++		}
++		isDir := header.FileInfo().IsDir()
++		if name == archivePath && !isDir {
++			_ = zw.Close()
++			return serveArchiveEntryAttachment(ctx, name, header.Size, tr)
++		}
++
++		if name == archivePath || isArchiveChild(name, archivePath) {
++			if err := copyTarEntryToZip(zw, name, header, tr); err != nil {
++				_ = zw.Close()
++				return err
++			}
++			dirEntryCount++
++		}
++	}
++
++	if dirEntryCount > 0 {
++		if err := zw.Close(); err != nil {
++			return err
++		}
++		return serveArchiveZipAttachment(ctx, archivePath, dirBuf.Bytes())
++	}
++	_ = zw.Close()
++	return errArchivePathNotFound
++}
++
++func serveArchiveEntryAttachment(ctx *context.Context, name string, size int64, reader io.Reader) error {
++	buf := make([]byte, 1024)
++	n, err := util.ReadAtMost(reader, buf)
++	if err != nil {
++		return err
++	}
++	buf = buf[:n]
++
++	contentType := typesniffer.ApplicationOctetStream
++	sniffedType := typesniffer.DetectContentType(buf, path.Base(name))
++	if sniffedType.IsBrowsableBinaryType() || sniffedType.IsText() {
++		contentType = sniffedType.GetMimeType()
++	}
++	httplib.ServeSetHeaders(ctx.Resp, &httplib.ServeHeaderOptions{
++		ContentType:   contentType,
++		ContentLength: &size,
++		Disposition:   "attachment",
++		Filename:      path.Base(name),
++	})
++
++	_, err = io.Copy(ctx.Resp, io.MultiReader(bytes.NewReader(buf), reader))
++	return err
++}
++
++func serveArchiveZipAttachment(ctx *context.Context, archivePath string, content []byte) error {
++	size := int64(len(content))
++	httplib.ServeSetHeaders(ctx.Resp, &httplib.ServeHeaderOptions{
++		ContentType:   "application/zip",
++		ContentLength: &size,
++		Disposition:   "attachment",
++		Filename:      path.Base(archivePath) + ".zip",
++	})
++	_, err := ctx.Resp.Write(content)
++	return err
++}
++
++func copyZipFileToZip(zw *zip.Writer, file *zip.File, name string) error {
++	header, err := zip.FileInfoHeader(file.FileInfo())
++	if err != nil {
++		return err
++	}
++	header.Name = archiveZipEntryName(name, file.FileInfo().IsDir())
++	header.Method = zip.Deflate
++
++	writer, err := zw.CreateHeader(header)
++	if err != nil {
++		return err
++	}
++	if file.FileInfo().IsDir() {
++		return nil
++	}
++
++	rc, err := file.Open()
++	if err != nil {
++		return err
++	}
++	defer rc.Close()
++	_, err = io.Copy(writer, rc)
++	return err
++}
++
++func copyTarEntryToZip(zw *zip.Writer, name string, header *tar.Header, reader io.Reader) error {
++	zipHeader, err := zip.FileInfoHeader(header.FileInfo())
++	if err != nil {
++		return err
++	}
++	zipHeader.Name = archiveZipEntryName(name, header.FileInfo().IsDir())
++	zipHeader.Method = zip.Deflate
++
++	writer, err := zw.CreateHeader(zipHeader)
++	if err != nil {
++		return err
++	}
++	if header.FileInfo().IsDir() {
++		return nil
++	}
++
++	_, err = io.Copy(writer, reader)
++	return err
++}
++
++func archiveZipEntryName(name string, isDir bool) string {
++	if isDir && !strings.HasSuffix(name, "/") {
++		return name + "/"
++	}
++	return name
++}
++
++func cleanArchiveFileName(name string) string {
++	if name == "" {
++		return ""
++	}
++	name = strings.ReplaceAll(name, "\\", "/")
++	name = strings.TrimPrefix(name, "/")
++	name = strings.TrimSuffix(name, "/")
++	name = path.Clean(name)
++	if name == "." || strings.HasPrefix(name, "../") || name == ".." {
++		return ""
++	}
++	return name
++}
