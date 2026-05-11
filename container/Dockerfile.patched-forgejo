@@ -1,0 +1,47 @@
+ARG UPSTREAM_IMAGE
+
+FROM --platform=$BUILDPLATFORM data.forgejo.org/oci/xx AS xx
+
+FROM --platform=$BUILDPLATFORM data.forgejo.org/oci/golang:1.26-alpine3.23 AS build-env
+
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY:-https://proxy.golang.org,direct}
+
+ARG RELEASE_VERSION
+ARG TAGS="sqlite sqlite_unlock_notify"
+ENV TAGS="bindata timetzdata $TAGS"
+ARG CGO_EXTRA_CFLAGS
+
+COPY --from=xx / /
+ARG TARGETPLATFORM
+RUN apk --no-cache add clang lld
+RUN xx-apk --no-cache add gcc musl-dev
+ENV CGO_ENABLED=1
+RUN xx-go --wrap
+RUN cp /*-alpine-linux-musl*/lib/ld-musl-*.so.1 /lib || true
+
+RUN apk --no-cache add build-base git nodejs npm
+
+COPY . ${GOPATH}/src/forgejo.org
+WORKDIR ${GOPATH}/src/forgejo.org
+
+RUN make clean-no-bindata
+RUN make frontend
+RUN go build contrib/environment-to-ini/environment-to-ini.go && xx-verify environment-to-ini
+RUN LDFLAGS="-buildid=" make FORGEJO_GENERATE_SKIP_HASH=true RELEASE_VERSION=$RELEASE_VERSION GOFLAGS="-trimpath -p=1" go-check generate-backend static-executable && xx-verify gitea
+
+FROM ${UPSTREAM_IMAGE}
+
+ARG RELEASE_VERSION
+ARG UPSTREAM_IMAGE
+ARG UPSTREAM_VERSION
+ARG PATCH_NAME
+ARG IMAGE_SOURCE
+
+LABEL org.opencontainers.image.source="${IMAGE_SOURCE}" \
+      org.opencontainers.image.version="${RELEASE_VERSION}" \
+      org.opencontainers.image.base.name="${UPSTREAM_IMAGE}" \
+      org.opencontainers.image.description="Forgejo ${UPSTREAM_VERSION} with ${PATCH_NAME} patch"
+
+COPY --from=build-env /go/src/forgejo.org/gitea /app/gitea/gitea
+COPY --from=build-env /go/src/forgejo.org/environment-to-ini /usr/local/bin/environment-to-ini
